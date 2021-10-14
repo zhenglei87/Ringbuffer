@@ -24,9 +24,14 @@
 #include "ringbuffer.hpp"
 #include<errno.h>
 
-RingBufferShm::RingBufferShm(int buf_size):
-RingBuffer(buf_size), path(""), id(0), init_buf_size(buf_size), shmptr(NULL)
+RingBufferShm::RingBufferShm(UINT32 buf_size):
+RingBuffer(), path(""), id(0), init_buf_size(buf_size), shmptr(NULL)
 {
+    while (buf_size & (buf_size -1))
+    {
+        buf_size = buf_size & (buf_size -1);
+    }
+    init_buf_size = buf_size << 1;//roundup pow of two, 简化取模运算
 }
 
 RingBufferShm::~RingBufferShm()
@@ -51,13 +56,13 @@ bool RingBufferShm::init(std::string module_name, std::string path, int id)
 
     shmptr = (char *)shmat(shmid, 0, 0);
     assert(shmptr != NULL);
-    return RingBuffer::init(module_name, shmptr);
+    return RingBuffer::init(module_name, shmptr, init_buf_size);
 }
 
-RingBuffer::RingBuffer(int buf_size)
+RingBuffer::RingBuffer()
 {
     head_ptr = NULL;
-    this->init_buf_size = buf_size;
+    this->init_buf_size = 0;
 }
 
 RingBuffer::~RingBuffer()
@@ -65,23 +70,32 @@ RingBuffer::~RingBuffer()
     ;
 }
 
-bool RingBuffer::init(std::string module_name, char *ptr)
+bool RingBuffer::init(std::string module_name, char *ptr, UINT32 buf_size)
 {
     head_ptr = (RingBufferInfo *)ptr;
+    this->init_buf_size = buf_size;
     (void)init_head(module_name);
     return true;
 }
 
 bool RingBuffer::init_head(std::string module_name)
 {
-    if ((head_ptr->head.inited == RING_BUFFER_INITED)
-            && (head_ptr->head.version == RING_BUFFER_VERSION)
-            && (head_ptr->head.buf_size == init_buf_size)
-            && (module_name == std::string(head_ptr->head.module_name)))
+    if (head_ptr->head.inited == RING_BUFFER_INITED)
     {
-        std::cout<<"module " << module_name << " version " <<head_ptr->head.version<<"already inited"<<std::endl;
-        return true;
+        if ((head_ptr->head.version != RING_BUFFER_VERSION)
+                || (head_ptr->head.buf_size != init_buf_size)
+                || (module_name != std::string(head_ptr->head.module_name)))
+        {
+            std::cout<<"shm module " << head_ptr->head.module_name << " version " <<head_ptr->head.version<<" size "<<head_ptr->head.buf_size<<" already inited"<<std::endl;
+            std::cout<<"init module " << module_name << " version "<<RING_BUFFER_VERSION<< " size "<< init_buf_size <<" already inited"<<std::endl;
+            return false;
+        }
+        else
+        {
+            return true;
+        }
     }
+
     memset(head_ptr, 0, sizeof(RingBufferHead));
     head_ptr->head.version = RING_BUFFER_VERSION;
     head_ptr->head.read_index = 0;
@@ -134,93 +148,59 @@ bool RingBuffer::is_empty()
 }
 bool RingBuffer::is_full()
 {
-    return head_ptr->head.read_index == next_write(1);
+    return ((head_ptr->head.read_index - head_ptr->head.write_index) & (head_ptr->head.buf_size -1)) == 0;
 }
 
 static void data_to_buffer(char *buf, char *data, int data_len, int index, int size)
 {
-    if ((index + data_len) <= size)
-    {
-        memcpy(&buf[index], data, data_len);
-    }
-    else
-    {
-        memcpy(&buf[index], data, size - index);
-        memcpy(&buf[0], &data[size - index], data_len + index - size);
-    }
+    auto l = std::min(data_len, size - index);
+    memcpy(&buf[index], data, l);
+    memcpy(&buf[0], data + l, data_len - l);
     return;
 }
 
-int RingBuffer::write_buf(char *data, int data_len)
+UINT32 RingBuffer::write_buf(char *data, UINT32 data_len)
 {
-    int free_buf = get_free();
-    int tmp_write_index = head_ptr->head.write_index;
+    UINT32 free_buf = get_free();
     if (data_len > free_buf)
     {
         head_ptr->head.drop_packet++;
         return -1;
     }
-
-    if (!is_ready()) return -1;
-    data_to_buffer(head_ptr->buf, data, data_len, tmp_write_index, get_size());
-    tmp_write_index = next_write(data_len);
-    if (!is_ready()) return -1;
-    head_ptr->head.write_index = tmp_write_index;
+    data_to_buffer(head_ptr->buf, data, data_len,
+            head_ptr->head.write_index & (head_ptr->head.buf_size - 1), get_size());
+    head_ptr->head.write_index += data_len;
     head_ptr->head.write_packet++;
     return data_len;
 }
 
-static void buffer_to_data(char *buf, char *data, int data_len, int index, int size)
+static void buffer_to_data(char *buf, char *data, UINT32 data_len, UINT32 index, UINT32 size)
 {
-    if ((index + data_len) <= size)
-    {
-        memcpy(data, &buf[index], data_len);
-    }
-    else
-    {
-        memcpy(data, &buf[index], size - index);
-        memcpy(&data[size - index], &buf[0], data_len + index - size);
-    }
+    auto l = std::min(data_len, size - index);
+    memcpy(data, &buf[index], l);
+    memcpy(&data[l], &buf[0], data_len - l);
     return;
 }
 
-int RingBuffer::read_buf(char *data, int max_data_len)
+UINT32 RingBuffer::read_buf(char *data, UINT32 max_data_len)
 {
-    if (is_empty()) return 0;
-
-    int cnt = get_cnt();
-    int read_cnt = (cnt > max_data_len) ? max_data_len : cnt;
-    int tmp_read_index = head_ptr->head.read_index;
-
-    if (!is_ready()) return 0;
-    buffer_to_data(head_ptr->buf, data, read_cnt, tmp_read_index, get_size());
-    tmp_read_index = next_read(read_cnt);
-    if (!is_ready()) return 0;
-
-    head_ptr->head.read_index = tmp_read_index;
+    UINT32 cnt = get_cnt();
+    UINT32 read_cnt = std::min(max_data_len, cnt);
+    buffer_to_data(head_ptr->buf, data, read_cnt, head_ptr->head.read_index & (head_ptr->head.buf_size - 1), get_size());
+    head_ptr->head.read_index += read_cnt;
     return read_cnt;
 }
 
-int RingBuffer::get_size()
+UINT32 RingBuffer::get_size()
 {
     return head_ptr->head.buf_size;
 }
-int RingBuffer::get_cnt()
+UINT32 RingBuffer::get_cnt()
 {
-    return (head_ptr->head.write_index + head_ptr->head.buf_size - head_ptr->head.read_index) % head_ptr->head.buf_size;
+    return (head_ptr->head.write_index - head_ptr->head.read_index);
 }
 
-int RingBuffer::get_free()
+UINT32 RingBuffer::get_free()
 {
-    return (head_ptr->head.read_index + head_ptr->head.buf_size - head_ptr->head.write_index -1) % head_ptr->head.buf_size;
-}
-
-int RingBuffer::next_read(int index)
-{
-    return (head_ptr->head.read_index + index) % head_ptr->head.buf_size;
-}
-
-int RingBuffer::next_write(int index)
-{
-    return (head_ptr->head.write_index + index) % head_ptr->head.buf_size;
+    return (head_ptr->head.read_index + head_ptr->head.buf_size - head_ptr->head.write_index);
 }
